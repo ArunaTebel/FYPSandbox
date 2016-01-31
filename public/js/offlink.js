@@ -14,7 +14,7 @@ OfflinkJs.controller('NavCtrl', function ($scope, $location) {
 
 //var OfflinkJs = angular.module('OfflinkJs', []);
 var previous = {};
-OfflinkJs.factory("ConnectionDetectorService", [function () {
+OfflinkJs.factory("ConnectionDetectorService", ['flnkSynchronizer', function (flnkSynchronizer) {
 
     var conDetector = URL.createObjectURL(new Blob(['(',
         function () {
@@ -56,6 +56,11 @@ OfflinkJs.factory("ConnectionDetectorService", [function () {
     URL.revokeObjectURL(conDetector);
     worker.addEventListener('message', function (e) {
         callbackFunc(e.data);
+        if (e.data === 200 && connectionStatus !== 200) {
+            console.info("Connection status changed from " + connectionStatus + " to " + e.data);
+            console.info("Auto Syncing started .... ");
+            flnkSynchronizer.syncAuto();
+        }
         connectionStatus = e.data;
     }, false);
 
@@ -77,11 +82,14 @@ OfflinkJs.factory("ConnectionDetectorService", [function () {
 
 
 OfflinkJs.factory('cacheInterceptor', ['localStorageService', '$q', '$location', function (localStorageService, $q, $location) {
+
+    var GET_CACHE = "GC";
+    var WRITE_CACHE = "WC";
     return {
         request: function (config) {
             if (config.flnk_cache) {
                 if (config.method === 'POST') {
-                    localStorageService.set(config.req_prefix + "." + Date.now(), config);
+                    //localStorageService.set(config.req_prefix + "." + Date.now(), config);
                 }
             }
             return config;
@@ -89,7 +97,7 @@ OfflinkJs.factory('cacheInterceptor', ['localStorageService', '$q', '$location',
         response: function (response) {
 
             if (response.config.flnk_cache && response.config.method === 'GET') {
-                localStorageService.set(response.config.url, response.data);
+                localStorageService.set(GET_CACHE + "<>" + response.config.url, response.data);
             }
             return response;
         },
@@ -117,9 +125,13 @@ OfflinkJs.factory('cacheInterceptor', ['localStorageService', '$q', '$location',
             }
             if (rejection.status === 0) {
                 console.log(rejection);
+
+                rejection.offline_action = true;
+
                 if (rejection.config.flnk_cache) {
+
                     if (rejection.config.method === 'GET') {
-                        rejection.data = localStorageService.get(rejection.config.url);
+                        rejection.data = localStorageService.get("GC<>" + rejection.config.url);
                     } else if (rejection.config.offlink_callback) {
                         rejection.config.offlink_callback(rejection);
                     } else if (rejection.config.fallback_url) {
@@ -129,9 +141,15 @@ OfflinkJs.factory('cacheInterceptor', ['localStorageService', '$q', '$location',
                         rejection.config.method === 'PUT' ||
                         rejection.config.method === 'DELETE'
                     ) {
-                        localStorageService.add(rejection.config.flnk_prefix + "." + Date.now(), rejection.config);
+                        var prefix = WRITE_CACHE + "<>" + rejection.config.flnk_prefix + "<>" + Date.now();
+                        if (rejection.config.flnk_auto_sync) {
+                            prefix += "<>auto"
+                        }
+                        localStorageService.add(prefix, rejection.config);
                     }
+
                 }
+
             }
             return rejection;
         }
@@ -140,85 +158,428 @@ OfflinkJs.factory('cacheInterceptor', ['localStorageService', '$q', '$location',
 
 OfflinkJs.factory('flnkSynchronizer', ['$http', 'localStorageService', function ($http, localStorageService) {
     return {
-        sync: function (prefix) {
+        syncByPrefix: function (prefix) {
+            var syncSuccess = [];
+            var syncFailed = [];
             var lsKeys = localStorageService.keys();
             angular.forEach(lsKeys, function (value, key) {
-                if (prefix === value.split(".")[0]) {
+                if (prefix === value.split("<>")[1]) {
                     var config = localStorageService.get(value);
-                    $http.post(config.url,
-                        config.data
+                    $http(
+                        {
+                            method: config.method,
+                            url: config.url,
+                            data: config.data,
+                            headers: config.headers,
+                            flnk_cache: config.flnk_cache,
+                            flnk_auto_sync: config.flnk_auto_sync,
+                            flnk_prefix: config.flnk_prefix,
+                            flnk_sync_callback: config.flnk_sync_callback
+                        }
                     ).then(function (response) {
+                        if (config.flnk_sync_callback) {
+                            config.flnk_sync_callback(response);
+                        }
+                        localStorageService.remove(value); // TODO: HANDLE THIS!
+                        syncSuccess.push(config);
                     }, function (response) {
+                        syncFailed.push(config);
                     });
                 }
             });
-            return lsKeys;
+            return {
+                sync_success: syncSuccess,
+                sync_failed: syncFailed
+            };
+        },
+
+        syncAuto: function () {
+            var syncSuccess = [];
+            var syncFailed = [];
+            var lsKeys = localStorageService.keys();
+            angular.forEach(lsKeys, function (value, key) {
+                if (value.split("<>").length === 4) {
+                    if (value.split("<>")[3] === 'auto') {
+                        var config = localStorageService.get(value);
+                        $http(
+                            {
+                                method: config.method,
+                                url: config.url,
+                                data: config.data,
+                                headers: config.headers,
+                                flnk_cache: config.flnk_cache,
+                                flnk_auto_sync: config.flnk_auto_sync,
+                                flnk_prefix: config.flnk_prefix,
+                                flnk_sync_callback: config.flnk_sync_callback
+                            }
+                        ).then(function (response) {
+                            if (config.flnk_sync_callback) {
+                                config.flnk_sync_callback(response);
+                            }
+                            localStorageService.remove(value); // TODO: HANDLE THIS!
+                            syncSuccess.push(config);
+                        }, function (response) {
+                            syncFailed.push(config);
+                        });
+                    }
+                }
+            });
+            return {
+                sync_success: syncSuccess,
+                sync_failed: syncFailed
+            };
+        },
+
+        bulkSync: function () {
+            var syncSuccess = [];
+            var syncFailed = [];
+            var lsKeys = localStorageService.keys();
+            angular.forEach(lsKeys, function (value, key) {
+                var config = localStorageService.get(value);
+                $http(
+                    {
+                        method: config.method,
+                        url: config.url,
+                        data: config.data,
+                        headers: config.headers,
+                        flnk_cache: config.flnk_cache,
+                        flnk_auto_sync: config.flnk_auto_sync,
+                        flnk_prefix: config.flnk_prefix,
+                        flnk_sync_callback: config.flnk_sync_callback
+                    }
+                ).then(function (response) {
+                    if (config.flnk_sync_callback) {
+                        config.flnk_sync_callback(response);
+                    }
+                    localStorageService.remove(value); // TODO: HANDLE THIS!
+                    syncSuccess.push(config);
+                }, function (response) {
+                    syncFailed.push(config);
+                });
+            });
+            return {
+                sync_success: syncSuccess,
+                sync_failed: syncFailed
+            };
         }
     };
 }]);
 
+
 OfflinkJs.factory('flnkDatabaseService', [function () {
     var _db = null;
-    var promise;
-    return {
-        init: function (schemaBuilder) {
-            promise = schemaBuilder.connect();
-            promise.then(function (db) {
-                _db = db;
+    var promise = null;
+    var schemaBuilder = null;
+
+    var EXCEPTION_MESSAGES = {
+        CREATE_DB_BEFORE_TABLES: "Please create a database, before creating tables.",
+        DB_NAME_EMPTY: "Database name cannot be empty",
+        DB_VERSION_NAN: "Database version should be a numeric value",
+        TABLE_SCHEMA_NOT_AN_OBJECT: "Table schema should be an object type",
+        TABLE_SCHEMA_EMPTY: "Table schema cannot be empty",
+        TABLE_NAME_PROP_NOT_FOUND: "Table schema should have a 'name' property",
+        TABLE_COLS_PROP_NOT_FOUND: "Table schema should have a 'columns' property",
+        INSERT_DATA_NOT_AN_OBJECT: "Data to insert should be an object type",
+        INSERT_DATA_ARRAY_EMPTY: "Data array to be inserted cannot be empty",
+        INSERT_DATA_EMPTY: "Data rows to be inserted cannot be empty",
+        TABLE_NAME_EMPTY: "Table name cannot be empty"
+    };
+
+    function assert(condition, message) {
+        if (!condition) {
+            throw new OfflinkDbException({
+                message: message,
+                name: 'OfflinkDbException'
             });
-            return promise;
+        } else {
+            return true;
+        }
+    }
+
+    function validateTableSchema(tables) {
+        try {
+            assert(typeof tables === 'object', EXCEPTION_MESSAGES.TABLE_SCHEMA_NOT_AN_OBJECT);
+            assert(tables.length > 0, EXCEPTION_MESSAGES.TABLE_SCHEMA_EMPTY);
+            if (tables.length > 0) {
+                for (var i = 0; i < tables.length; i++) {
+                    for (var prop in tables[i]) {
+                        assert(tables[i].hasOwnProperty('table_name'), EXCEPTION_MESSAGES.TABLE_NAME_PROP_NOT_FOUND);
+                        assert(tables[i].hasOwnProperty('columns'), EXCEPTION_MESSAGES.TABLE_COLS_PROP_NOT_FOUND);
+                    }
+                }
+            }
+        }
+        catch (e) {
+            throw e;
+        }
+    }
+
+    function validateInsertBulkData(data) {
+        try {
+            assert(typeof data === 'object', EXCEPTION_MESSAGES.INSERT_DATA_NOT_AN_OBJECT);
+            assert(data.length > 0, EXCEPTION_MESSAGES.INSERT_DATA_ARRAY_EMPTY);
+            if (data.length > 0) {
+                for (var i = 0; i < data.length; i++) {
+                    assert(Object.keys(data[i]).length > 0, EXCEPTION_MESSAGES.INSERT_DATA_EMPTY)
+                }
+            }
+        } catch (e) {
+            throw e;
+        }
+    }
+
+    function OfflinkDbException(e) {
+        console.error(e.name, e.message);
+        this.message = e.message;
+        this.name = e.name;
+    }
+
+    return {
+
+        DATA_TYPES: {
+            ARRAY_BUFFER: lf.Type.ARRAY_BUFFER,
+            BOOLEAN: lf.Type.BOOLEAN,
+            DATE_TIME: lf.Type.DATE_TIME,
+            INTEGER: lf.Type.INTEGER,
+            NUMBER: lf.Type.NUMBER,
+            STRING: lf.Type.STRING,
+            OBJECT: lf.Type.OBJECT
+        },
+
+        CONSTRAINT_ACTIONS: {
+            CASCADE: lf.ConstraintAction.CASCADE
+        },
+
+        OP: {
+            AND: lf.op.and,
+            OR: lf.op.or,
+            NOT: lf.op.not
+        },
+
+        ORDER: {
+            ASC: lf.Order.ASC,
+            DESC: lf.Order.DESC
+        },
+
+        FN: {
+            AVG: lf.fn.avg,
+            COUNT: lf.fn.count,
+            DISTINCT: lf.fn.distinct,
+            GEOMEAN: lf.fn.geomean,
+            MAX: lf.fn.max,
+            MIN: lf.fn.min,
+            STDDEV: lf.fn.stddev,
+            SUM: lf.fn.sum
+        },
+
+        bind: lf.bind,
+
+        createSchema: function (dbName, version) {
+            if (dbName) {
+                if (!isNaN(version)) {
+                    schemaBuilder = lf.schema.create(dbName, version);
+                } else {
+                    throw new OfflinkDbException({
+                        message: EXCEPTION_MESSAGES.DB_VERSION_NAN,
+                        name: "OfflinkDbException"
+                    });
+                }
+            } else {
+                throw new OfflinkDbException({
+                    message: EXCEPTION_MESSAGES.DB_NAME_EMPTY,
+                    name: "OfflinkDbException"
+                });
+            }
+        },
+
+        initConnection: function (dbName, version) {
+            if (schemaBuilder === null) {
+                promise = lf.schema.create(dbName, version).connect();
+                promise.then(function (db) {
+                    _db = db;
+                });
+                return promise;
+            }
+        },
+
+        createTables: function (tables) {
+            if (schemaBuilder === null) {
+                throw new OfflinkDbException({
+                    message: EXCEPTION_MESSAGES.CREATE_DB_BEFORE_TABLES,
+                    name: "OfflinkDbException"
+                });
+            } else {
+                try {
+                    validateTableSchema(tables);
+                } catch (e) {
+                    throw e;
+                }
+                for (var i = 0; i < tables.length; i++) {
+                    var sb = schemaBuilder.createTable(tables[i].table_name);
+                    for (var colName in tables[i].columns) {
+                        if (tables[i].columns.hasOwnProperty(colName)) {
+                            sb.addColumn(colName, tables[i].columns[colName]);
+                        }
+                    }
+                    sb.addPrimaryKey([tables[i].primary_key]);
+                    if (tables[i].foreign_key) {
+                        if (tables[i].foreign_key.action) {
+                            sb.addForeignKey(tables[i].foreign_key.name, {
+                                local: tables[i].foreign_key.local,
+                                ref: tables[i].foreign_key.ref,
+                                action: tables[i].foreign_key.action
+                            });
+                        } else {
+                            sb.addForeignKey(tables[i].foreign_key.name, {
+                                local: tables[i].foreign_key.local,
+                                ref: tables[i].foreign_key.ref
+                            });
+                        }
+
+                    }
+                }
+                promise = schemaBuilder.connect();
+                promise.then(function (db) {
+                    _db = db;
+                });
+                return promise;
+            }
         },
         insert: function (tableName, data) {
+            if (!tableName) {
+                throw new OfflinkDbException({
+                    message: EXCEPTION_MESSAGES.TABLE_NAME_EMPTY,
+                    name: "OfflinkDbException"
+                });
+            }
+            try {
+                // TODO: Implement this function
+                //validateInsertSingleData(data);
+            } catch (e) {
+                throw e;
+            }
+            var rows = [];
             var table, row;
             if (_db != null) {
                 table = _db.getSchema().table(tableName);
-                row = table.createRow(data);
-                return _db.insertOrReplace().into(table).values([row]).exec();
+                rows.push(table.createRow(data[0]));
+                return _db.insertOrReplace().into(table).values(rows).exec();
             } else {
                 return promise.then(function (db) {
                     _db = db;
                     table = _db.getSchema().table(tableName);
-                    row = table.createRow(data);
-                    return _db.insertOrReplace().into(table).values([row]).exec();
+                    rows.push(table.createRow(data[0]));
+                    return _db.insertOrReplace().into(table).values(rows).exec();
                 });
-                //return schemaBuilder.connect().then(function (db) {
-                //    console.log("muwahaha");
-                //    _db = db;
-                //    table = _db.getSchema().table(tableName);
-                //    row = table.createRow(data);
-                //    return _db.insertOrReplace().into(table).values([row]).exec();
-                //});
             }
         },
 
-        read: function (tableName, selectParam) {
-            //console.log(selectParam[0]);
-            var table;
-            //angular.forEach(selectParam,function(param){
-            //        console.log(param);
-            //    }
-            // );
+        insertBulk: function (tableName, data) {
+            if (!tableName) {
+                throw new OfflinkDbException({
+                    message: EXCEPTION_MESSAGES.TABLE_NAME_EMPTY,
+                    name: "OfflinkDbException"
+                });
+            }
+            try {
+                validateInsertBulkData(data);
+            } catch (e) {
+                throw e;
+            }
+            var rows = [];
+            var table, row;
             if (_db != null) {
                 table = _db.getSchema().table(tableName);
-                return _db.select.apply(this, selectParam).from(table).exec();
-                /**
-                 * TODO: add query parameters
-                 */
-                //return _db.select().from(table).where(item.done.eq(false)).exec();
+
+                for (var i = 0; i < data.length; i++) {
+                    rows.push(table.createRow(data[i]));
+                }
+
+                return _db.insertOrReplace().into(table).values(rows).exec();
             } else {
                 return promise.then(function (db) {
                     _db = db;
                     table = _db.getSchema().table(tableName);
-                    return _db.select().from(table).exec();
+
+                    for (var i = 0; i < data.length; i++) {
+                        rows.push(table.createRow(data[i]));
+                    }
+
+                    return _db.insertOrReplace().into(table).values(rows).exec();
                 });
-                //return schemaBuilder.connect().then(function (db) {
-                //    _db = db;
-                //    table = _db.getSchema().table(tableName);
-                //    return _db.select().from(table).exec();
-                //});
+            }
+        },
+
+        getTableRef: function (tableName) {
+            return promise.then(function (db) {
+                _db = db;
+                return _db.getSchema().table(tableName);
+            });
+        },
+
+        select: function (attrs) {
+            if (_db != null) {
+                return _db.select(attrs);
+            } else {
+                return promise.then(function (db) {
+                    _db = db;
+                    return _db.select(attrs);
+                });
+            }
+        },
+
+        getAllFromTable: function (tableName) {
+            return promise.then(function (db) {
+                _db = db;
+                var table = _db.getSchema().table(tableName);
+                return _db.select().from(table).exec().then(function (results) {
+                    return results;
+                });
+            });
+        },
+
+        selectByIdFromTable: function (tableName, id) {
+            return promise.then(function (db) {
+                _db = db;
+                var table = _db.getSchema().table(tableName);
+                return _db.select().from(table).where(table.id.eq(id)).exec().then(function (results) {
+                    return results;
+                });
+            });
+        },
+
+        update: function (table) {
+            if (_db != null) {
+                return _db.update(table);
+            } else {
+                return promise.then(function (db) {
+                    _db = db;
+                    return _db.update(table);
+                });
+            }
+        },
+
+        deleteFrom: function (table) {
+            if (_db != null) {
+                return _db.delete().from(table);
+            } else {
+                return promise.then(function (db) {
+                    _db = db;
+                    return _db.delete().from(table);
+                });
+            }
+        },
+
+        deleteAllFromTable: function (table) {
+            if (_db != null) {
+                return _db.delete().from(table).exec();
+            } else {
+                return promise.then(function (db) {
+                    _db = db;
+                    return _db.delete().from(table).exec();
+                });
             }
         }
-
 
     };
 }]);
@@ -237,7 +598,7 @@ OfflinkJs.factory('flinkPrefetchService', ['$window', '$indexedDB', 'localStorag
                     head.append("<link rel='prefetch' href=" + OFFlINK_STATIC_CACHE[i] + ">");
                 }
             },
-            myFunc: function (dom) {
+            dynamicPrefetch: function (dom) {
                 dom = typeof dom !== 'undefined' ? dom : $document;
                 var threshold = 1;
                 var absUrl = $location.absUrl();
@@ -265,14 +626,7 @@ OfflinkJs.factory('flinkPrefetchService', ['$window', '$indexedDB', 'localStorag
                     });
                 });
             },
-            dynamicPrefetch: function (current, previous) {
-                //console.log("Inside Dynamic Prefetch");
-                //var prev = localStorageService.get("previous");
-                //console.log("Previous page : " + prev);
-                //if (prev == null) {
-                //    localStorageService.set("previous", $location.absUrl());
-                //}
-                //console.log("Current page : " + $location.absUrl());
+            updateDynamicPrefetchModel: function (current, previous) {
                 $indexedDB.openStore('dynamic_prefetch_cache', function (store) {
                         store.find(previous).then(function (e) {
                             var childPageExists = false;
@@ -314,36 +668,10 @@ OfflinkJs.factory('flinkPrefetchService', ['$window', '$indexedDB', 'localStorag
 OfflinkJs.run(['$location', 'localStorageService', 'flinkPrefetchService', '$rootScope',
     function ($location, localStorageService, flinkPrefetchService, $rootScope) {
         $rootScope.$on("$locationChangeSuccess", function (event, current, previous) {
-            flinkPrefetchService.dynamicPrefetch(current, previous);
-            flinkPrefetchService.myFunc();
+            flinkPrefetchService.updateDynamicPrefetchModel(current, previous);
+            flinkPrefetchService.dynamicPrefetch();
         });
-        //var prev = localStorageService.get("previous");
-        //console.log("Previous page : " + prev);
-        //if (prev == null) {
-        //    localStorageService.set("previous", $location.absUrl());
-        //}
-        //console.log("Current page : " + $location.absUrl());
-        //flinkPrefetchService.dynamicPrefetch(prev, $location.absUrl());
-        //localStorageService.set("previous", $location.absUrl());
-        //
-        //previous = $location.absUrl();
-
     }]);
-
-//OfflinkJs.provider('dynamicPrefetch', function DynamicPrefetchProvider($indexedDB) {
-//
-//    this.insertData = function () {
-//        $indexedDB.openStore('prefetch_cache1', function (store) {
-//            store.insert({"ssn": "444-444-222-111", "surname": "ABCD", "age": 17}).then(function (e) {
-//                console.log(e);
-//            });
-//        });
-//    };
-//    this.$get = ['$indexedDB', function dynamicPrefetchFactory($indexedDB) {
-//        return new DynamicPrefetch($indexedDB);
-//    }];
-//
-//});
 
 OfflinkJs.config(['$indexedDBProvider', '$httpProvider', 'localStorageServiceProvider',
     function ($indexedDBProvider, $httpProvider, localStorageServiceProvider) {
@@ -360,6 +688,3 @@ OfflinkJs.config(['$indexedDBProvider', '$httpProvider', 'localStorageServicePro
             });
 
     }]);
-
-
-
